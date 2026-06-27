@@ -80,6 +80,71 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok", hasApiKey: Boolean(FINNHUB_KEY) });
 });
 
-app.listen(PORT, () => {
-  console.log(`Tradeline backend listening on port ${PORT}`);
+// Same caching idea as quotes — news doesn't change second-to-second, so
+// there's no reason to re-hit Finnhub on every dashboard refresh.
+const NEWS_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const newsCache = new Map(); // symbol -> { data, expiresAt }
+
+app.get("/api/news/:symbol", async (req, res) => {
+  const symbol = req.params.symbol.toUpperCase();
+
+  if (!SYMBOL_PATTERN.test(symbol)) {
+    return res.status(400).json({ error: "Invalid symbol format." });
+  }
+  if (!FINNHUB_KEY) {
+    return res.status(500).json({ error: "Server is missing its API key configuration." });
+  }
+
+  const cached = newsCache.get(symbol);
+  if (cached && cached.expiresAt > Date.now()) {
+    return res.json({ items: cached.data, cached: true });
+  }
+
+  try {
+    const to = new Date();
+    const from = new Date(to.getTime() - 7 * 24 * 60 * 60 * 1000); // last 7 days
+    const fmt = (d) => d.toISOString().slice(0, 10);
+
+    const url = `https://finnhub.io/api/v1/company-news?symbol=${encodeURIComponent(
+      symbol
+    )}&from=${fmt(from)}&to=${fmt(to)}&token=${FINNHUB_KEY}`;
+
+    const response = await fetch(url);
+    if (!response.ok) {
+      return res.status(response.status).json({ error: "Upstream news provider error." });
+    }
+
+    const raw = await response.json();
+
+    // Finnhub returns an array of articles. Reshape to clear field names,
+    // same reasoning as the quote endpoint: the frontend should never need
+    // to know Finnhub's specific response shape, which is what makes
+    // swapping providers later a contained change.
+    const shaped = (Array.isArray(raw) ? raw : [])
+      .slice(0, 10) // cap per symbol so the feed doesn't get overwhelmed by one ticker
+      .map((item) => ({
+        id: item.id,
+        symbol,
+        headline: item.headline,
+        source: item.source,
+        url: item.url,
+        timestamp: item.datetime ? item.datetime * 1000 : null, // Finnhub uses unix seconds; ms is friendlier for JS Date
+      }));
+
+    newsCache.set(symbol, { data: shaped, expiresAt: Date.now() + NEWS_CACHE_TTL_MS });
+
+    res.json({ items: shaped, cached: false });
+  } catch (err) {
+    console.error("News fetch failed:", err.message);
+    res.status(502).json({ error: "Failed to reach upstream news provider." });
+  }
+});
+
+// Binding explicitly to 0.0.0.0 (all network interfaces) rather than
+// relying on Express's default. In some container environments, the
+// default bind resolves to localhost only — the app looks like it's
+// running fine in the logs, but Railway's external router can't reach
+// it, which is exactly the "logs look fine, URL doesn't load" symptom.
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Tradeline backend listening on 0.0.0.0:${PORT}`);
 });
