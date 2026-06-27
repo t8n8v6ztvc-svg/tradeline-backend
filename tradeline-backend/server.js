@@ -140,6 +140,74 @@ app.get("/api/news/:symbol", async (req, res) => {
   }
 });
 
+// Historical daily candles — the raw price history that real RSI/EMA/
+// pivots/etc. would be computed from. Whether this works depends on the
+// Finnhub account's tier; if it returns a 403 here, that means candles
+// are gated behind a paid plan and indicators need to stay simulated.
+const CANDLE_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes — daily candles don't change intraday
+const candleCache = new Map();
+
+app.get("/api/candles/:symbol", async (req, res) => {
+  const symbol = req.params.symbol.toUpperCase();
+
+  if (!SYMBOL_PATTERN.test(symbol)) {
+    return res.status(400).json({ error: "Invalid symbol format." });
+  }
+  if (!FINNHUB_KEY) {
+    return res.status(500).json({ error: "Server is missing its API key configuration." });
+  }
+
+  const cached = candleCache.get(symbol);
+  if (cached && cached.expiresAt > Date.now()) {
+    return res.json({ ...cached.data, cached: true });
+  }
+
+  try {
+    const to = Math.floor(Date.now() / 1000);
+    const from = to - 100 * 24 * 60 * 60; // ~100 days, enough for RSI-14/EMA-50 warmup
+    const url = `https://finnhub.io/api/v1/stock/candle?symbol=${encodeURIComponent(
+      symbol
+    )}&resolution=D&from=${from}&to=${to}&token=${FINNHUB_KEY}`;
+
+    const response = await fetch(url);
+
+    if (response.status === 403) {
+      return res.status(403).json({
+        error: "Candle data requires a paid Finnhub plan on this account.",
+        available: false,
+      });
+    }
+    if (!response.ok) {
+      return res.status(response.status).json({ error: "Upstream data provider error.", available: false });
+    }
+
+    const raw = await response.json();
+    if (raw.s !== "ok" || !Array.isArray(raw.c)) {
+      return res.status(502).json({ error: "Unexpected response shape from data provider.", available: false });
+    }
+
+    // Finnhub returns parallel arrays (c=close, h=high, l=low, o=open,
+    // t=timestamp, v=volume). Reshape into one array of candle objects —
+    // much easier for indicator math to consume than parallel arrays.
+    const candles = raw.t.map((t, i) => ({
+      time: t,
+      open: raw.o[i],
+      high: raw.h[i],
+      low: raw.l[i],
+      close: raw.c[i],
+      volume: raw.v[i],
+    }));
+
+    const shaped = { symbol, candles, available: true };
+    candleCache.set(symbol, { data: shaped, expiresAt: Date.now() + CANDLE_CACHE_TTL_MS });
+
+    res.json({ ...shaped, cached: false });
+  } catch (err) {
+    console.error("Candle fetch failed:", err.message);
+    res.status(502).json({ error: "Failed to reach upstream data provider.", available: false });
+  }
+});
+
 // Binding explicitly to 0.0.0.0 (all network interfaces) rather than
 // relying on Express's default. In some container environments, the
 // default bind resolves to localhost only — the app looks like it's
